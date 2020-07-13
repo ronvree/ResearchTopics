@@ -3,9 +3,8 @@ import argparse
 from copy import deepcopy
 
 import torch
-from torch.distributions import MultivariateNormal
 
-from environment import Environment, EnvironmentBatcher
+from v1.environment import EnvironmentBatcher
 
 
 class CEM:
@@ -22,25 +21,17 @@ class CEM:
         self.num_candidates = args.J
         self.num_top_candidates = args.K
 
-    def plan(self, env: EnvironmentBatcher):
-        """
+    def plan(self,
+             env: EnvironmentBatcher,
+             device=torch.device('cpu')
+             ):
 
-        :param env:
-        :return:
-        """
-
-
-        # # Obtain the initial environment state from which trajectories should be executed
-        # state, _, _ = env.reset()
+        # TODO -- this assumes total observability
+        init_states = env.get_states()
 
         # Define size variables
         batch_size = env.num_environments
         action_shape = env.action_shape
-
-
-        # # Determine which device should be used
-        # device = state.device
-        device = torch.device('cpu')  # TODO -- fix this
 
         # Initialize action belief parameters
         param_shape = (batch_size, self.horizon_distance) + action_shape
@@ -49,17 +40,12 @@ class CEM:
 
         # Optimize the action belief parameters
         for i in range(self.num_iter):
-            # Expand the parameters to sample all candidates at ones
-            expanded_shape = (batch_size, self.num_candidates) + param_shape[1:]  # TODO -- this is ugly
-            expanded_mean = mean.unsqueeze(1).expand(*expanded_shape)
-            expanded_std = std.unsqueeze(1).expand(*expanded_shape)
             # Sample all action sequences of all candidates from the current action belief
-            batch_J_H_actions = torch.normal(expanded_mean, expanded_std)  # Shape: (bs, J, H) + action_shape
+            batch_J_H_actions = self._sample_action_candidates(mean, std)  # Shape: (bs, J, H) + action_shape
+
             # Evaluate all candidate action sequences. Store the return for each candidate
             candidate_returns = [None] * self.num_candidates
             for j, batch_H_actions in zip(range(self.num_candidates), batch_J_H_actions.split(1, dim=1)):  # TODO -- this can just be enumerate
-
-                sim_env = deepcopy(env)
 
                 # Remove the redundant candidate dimension of the single candidate action sequence (batch)
                 # Shape: (bs, H) + action_shape
@@ -72,15 +58,15 @@ class CEM:
                     # Shape: (bs,) + action_shape
                     batch_actions = batch_actions.view(batch_size, *action_shape)
                     # Execute the actions in the environment
-                    _, rs, _, _ = sim_env.step(batch_actions)
+                    _, rs, _, _ = env.step(batch_actions)
                     # Add the return
                     returns += rs.view(batch_size, 1)
 
                 # Store the return of this candidate
                 candidate_returns[j] = returns
 
-                # # Reset the environment for the next candidate batch
-                # env.reset()
+                # Reset the environment for the next candidate batch
+                env.set_states(init_states)
 
             # Transform the return sequence to a tensor
             returns = torch.cat(candidate_returns, dim=1)  # Shape: (batch_size, num_candidates)
@@ -104,6 +90,27 @@ class CEM:
             std = torch.cat(new_std, dim=0)
 
         return mean[:, 0]
+
+    def _sample_action_candidates(self, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        """
+        Use the given parameterization of the action belief to sample number of action sequence candidates
+        :param mean: a tensor containing a batch of mean values for the action parameters
+                     Shape: (batch_size, horizon_distance, ) + action_shape
+        :param std: a tensor containing a batch of std values for the action parameters
+                     Shape: (batch_size, horizon_distance, ) + action_shape
+        :return: a tensor containing a batch of candidate action sequences, sampled from the given parameters
+                     Shape: (batch_size, num_candidates, horizon_distance,) + action_shape
+        """
+        # Get the batch size from the parameter tensor
+        batch_size = mean.size(0)
+        # Create an extra 'candidate' dimension (using unsqueeze)
+        # Expand the parameter tensors over this dimension. The other dimensions remain the same
+        expanded_mean = mean.unsqueeze(1).expand(batch_size, self.num_candidates, *mean.shape[1:])
+        expanded_std = std.unsqueeze(1).expand(batch_size, self.num_candidates, *std.shape[1:])
+        # Sample the candidate action sequences
+        # Shape: (batch_size, num_candidates, horizon_distance,) + action_shape
+        action_candidate_seqs = torch.normal(expanded_mean, expanded_std)
+        return action_candidate_seqs
 
     @staticmethod
     def build_argument_parser(parser: argparse.ArgumentParser = None) -> argparse.ArgumentParser:
@@ -130,11 +137,13 @@ class CEM:
 
 
 if __name__ == '__main__':
-    from environment import GYM_ENVS, GymEnv, EnvironmentBatcher
+    from v1.environment import EnvironmentBatcher
+    from v1.environment.env_gym import GYM_ENVS
 
     _args = argparse.Namespace()
     _args.env_name = GYM_ENVS[0]
     _args.num_env = 1
+    _args.disable_cuda = True
 
     _args.H = 20
     _args.I = 5
@@ -152,7 +161,7 @@ if __name__ == '__main__':
 
     _envs.reset()
     for _i in range(10000):
-        _actions = _cem.plan(_envs)
+        _actions = _cem.plan(_envs.clone())
 
         _observations, _rewards, _terminals, _infos = _envs.step(_actions)
 

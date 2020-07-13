@@ -1,10 +1,9 @@
 import argparse
-import tqdm
 
 import torch
 
 
-from planner import CEM
+from v1.planner import CEM
 
 
 class PlaNet(torch.nn.Module):

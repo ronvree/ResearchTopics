@@ -1,11 +1,4 @@
-import argparse
-import tqdm
-
-import torch
-
-
-from environment import *
-from planet import *
+from v1.planet import *
 
 
 def build_argument_parser() -> argparse.ArgumentParser:

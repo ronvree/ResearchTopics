@@ -1,7 +1,10 @@
 import cv2
-import numpy as np
-import torch
 import argparse
+from copy import deepcopy
+
+import numpy as np
+
+import torch
 
 
 GYM_ENVS = [
@@ -49,6 +52,12 @@ def build_env_from_args(args: argparse.Namespace) -> "Environment":
 
 class Environment:
 
+    # TODO -- action repeat
+    # TODO -- finite time steps
+    # TODO -- select which device
+    # TODO -- rendering
+    # TODO -- set states
+
     """
     Abstract class for defining an environment
     """
@@ -60,6 +69,30 @@ class Environment:
                     - the initial observation
                     - a flag indicating whether the environment has terminated
                     - a dict possibly containing additional information
+        """
+        raise NotImplementedError
+
+    def get_state(self):  # TODO -- maybe add warning about complete observability
+        """
+        Get the environment state
+        Note: Using this function assumes complete observability!
+        :return: the environment state
+        """
+        raise NotImplementedError
+
+    def set_state(self, state):
+        """
+        Set the environment state
+        :param state: the environment will be set to this state
+        """
+        raise NotImplementedError
+
+    def clone(self, set_init_state: bool = False) -> "Environment":
+        """
+        Get a deep copy of the environment
+        :param set_init_state: When set to True, the current environment state will be considered the initial state.
+                               self.reset() will set the environment state to this initial state
+        :return: a deep copy of this environment
         """
         raise NotImplementedError
 
@@ -99,27 +132,75 @@ class Environment:
 
 class ControlSuiteEnvironment(Environment):
 
-    pass  # TODO
-
     def __init__(self, args: argparse.Namespace):
-        pass
+        from dm_control import suite
+        from dm_control.suite.wrappers import pixels
+
+        domain, task = args.env_name.split('-')
+
+        self._env = suite.load(domain_name=domain, task_name=task)
+
+        self._env = pixels.Wrapper(self._env)  # TODO
 
     def reset(self) -> tuple:
-        raise NotImplementedError
+        """
+
+        :return:
+        """
+        result = self._env.reset()
+
+        obs, _, terminal, info = self._process_result(result)
+
+        return obs, terminal, info
 
     def step(self, action) -> tuple:
-        raise NotImplementedError
+        """
+
+        :param action:
+        :return:
+        """
+        action = action.detach().numpy()
+
+        result = self._env.step(action)
+
+        return self._process_result(result)
 
     def close(self):
-        raise NotImplementedError
+        """
+
+        :return:
+        """
+        return self._env.close()
 
     @property
     def observation_shape(self) -> tuple:
+        # return sum([(1 if len(obs.shape) == 0 else obs.shape[0]) for obs in
+        #             self._env.observation_spec().values()]) if self.symbolic else (3, 64, 64)
+
+        pass  # TODO
+
         raise NotImplementedError
 
     @property
     def action_shape(self) -> tuple:
-        raise NotImplementedError
+        raise self._env.action_spec().shape
+
+    def _process_result(self, result) -> tuple:
+        """
+
+        :param result:
+        :return:
+        """
+        observation = [np.asarray([obs]) if isinstance(obs, float) else obs for obs in result.observation.values()]
+        observation = np.concatenate(observation)
+        observation = torch.FloatTensor(observation)  # TODO -- device
+
+        reward = result.reward
+        reward = torch.FloatTensor([result.reward]) if reward is not None else None
+
+        terminal = result.last()
+
+        return observation, reward, terminal, {}
 
 
 class GymEnv(Environment):
@@ -205,25 +286,36 @@ class EnvironmentBatcher:
     def __init__(self, args: argparse.Namespace):
         assert args.num_env > 0
 
-        self._num_env = args.num_env
-        self._envs = [build_env_from_args(args) for _ in range(self._num_env)]
+        self._envs = [build_env_from_args(args) for _ in range(args.num_env)]
 
     @property
     def action_shape(self) -> tuple:
+        """
+        :return: a tuple describing the shape of actions (excluding batch dimension)
+        """
         return self._envs[0].action_shape
 
     @property
     def observation_shape(self) -> tuple:
+        """
+        :return: a tuple describing the shape of observations (excluding batch dimension)
+        """
         return self._envs[0].observation_shape
 
     @property
     def num_environments(self) -> int:
-        return self._num_env
+        """
+        :return: the number of environments in this batch of environments
+        """
+        return len(self._envs)
 
     def reset(self) -> tuple:
         """
-
-        :return:
+        Reset all environments
+        :return: a 3-tuple consisting of:
+                    - a single tensor containing all initial observations
+                    - a tuple containing all termination flags
+                    - a tuple containing all info dicts
         """
         # Reset all environments, collect all results
         results = [env.reset() for env in self._envs]
@@ -234,14 +326,16 @@ class EnvironmentBatcher:
         # Return all results as a tuple
         return tuple(results)
 
-    def step(self, actions) -> tuple:  # TODO -- what is the type of actions? pass as single tensor with batch dim or list of tensors?
+    def step(self, actions: torch.Tensor) -> tuple:
         """
-
-        :param actions:
-        :return:
-        """
-        # TODO -- what is the return type? a tuple of tensors? a list of tuples with individual results?
-
+        Perform an action in each of the environments
+        :param actions: a tensor containing a batch of actions. Shape: (batch_size,) + action_shape
+        :return: a 4-tuple consisting of:
+                    - a single tensor containing all observations. Shape: (batch_size,) + observation_shape
+                    - a single tensor containing all rewards. Shape: (batch_size, 1)
+                    - a tuple containing all termination flags
+                    - a tuple containing all info dicts
+        """  # TODO -- should rewards be shaped (batch_size,) ?
         # Perform the actions on the environments
         results = [env.step(action) for env, action in zip(self._envs, actions)]
         # Unzip all tuples into 4 tuples containing the observations, rewards, flags and info dicts, respectively
@@ -249,14 +343,14 @@ class EnvironmentBatcher:
         # Merge all observations to one tensor
         results[0] = torch.cat([o.view(1, *self.observation_shape) for o in results[0]], dim=0)
         # Merge all rewards to one tensor
-        results[1] = torch.cat([r.view(1, 1) for r in results[1]], dim=0)
+        results[1] = torch.cat([r for r in results[1]], dim=0)
         # Return all results as a tuple
         return tuple(results)
 
     def close(self) -> tuple:
         """
-
-        :return:
+        Close all environments
+        :return: a tuple containing the results of closing each environment
         """
         return tuple(env.close() for env in self._envs)
 
@@ -264,9 +358,10 @@ class EnvironmentBatcher:
 if __name__ == '__main__':
 
     _args = argparse.Namespace()
-    _args.env_name = GYM_ENVS[0]
+    # _args.env_name = GYM_ENVS[0]
+    _args.env_name = CONTROL_SUITE_ENVS[0]
 
-    _args.num_env = 4
+    _args.num_env = 1
 
     # _env = GymEnv(_args)
     #
